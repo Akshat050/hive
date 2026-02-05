@@ -246,6 +246,8 @@ class SharedMemory:
     # Locks for thread-safe parallel execution
     _lock: asyncio.Lock | None = field(default=None, repr=False)
     _key_locks: dict[str, asyncio.Lock] = field(default_factory=dict, repr=False)
+    # Track which branch wrote each key during parallel execution
+    _key_writers: dict[str, str] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         """Initialize the main lock if not provided."""
@@ -332,6 +334,85 @@ class SharedMemory:
                             "If this is intentional, use validate=False."
                         )
             self._data[key] = value
+
+    async def write_async_parallel(
+        self,
+        key: str,
+        value: Any,
+        branch_id: str,
+        conflict_strategy: str = "last_wins",
+        validate: bool = True,
+    ) -> bool:
+        """
+        Thread-safe async write with conflict detection for parallel execution.
+
+        Args:
+            key: The memory key to write to
+            value: The value to write
+            branch_id: Identifier for the branch making the write
+            conflict_strategy: How to handle conflicts - "last_wins", "first_wins", or "error"
+            validate: If True, check for suspicious content (default True)
+
+        Returns:
+            True if write was performed, False if skipped due to first_wins strategy
+
+        Raises:
+            PermissionError: If node does not have write permission
+            MemoryWriteError: If value appears to be hallucinated content
+            RuntimeError: If conflict_strategy is "error" and a conflict is detected
+        """
+        # Check permissions first (no lock needed)
+        if self._allowed_write and key not in self._allowed_write:
+            raise PermissionError(f"Node not allowed to write key: {key}")
+
+        # Ensure key has a lock (double-checked locking pattern)
+        if key not in self._key_locks:
+            async with self._lock:
+                if key not in self._key_locks:
+                    self._key_locks[key] = asyncio.Lock()
+
+        # Acquire per-key lock and write
+        async with self._key_locks[key]:
+            # Check for conflict
+            if key in self._key_writers and self._key_writers[key] != branch_id:
+                existing_writer = self._key_writers[key]
+                if conflict_strategy == "error":
+                    raise RuntimeError(
+                        f"Memory conflict: key '{key}' already written by branch "
+                        f"'{existing_writer}', cannot write from branch '{branch_id}'"
+                    )
+                elif conflict_strategy == "first_wins":
+                    logger.info(
+                        f"Memory conflict: key '{key}' already written by "
+                        f"'{existing_writer}', skipping write from '{branch_id}' (first_wins)"
+                    )
+                    return False
+                # else: last_wins - proceed with write
+                logger.debug(
+                    f"Memory conflict: key '{key}' overwritten by "
+                    f"'{branch_id}' (was '{existing_writer}', last_wins)"
+                )
+
+            if validate and isinstance(value, str):
+                if len(value) > 5000:
+                    if self._contains_code_indicators(value):
+                        logger.warning(
+                            f"⚠ Suspicious write to key '{key}': appears to be code "
+                            f"({len(value)} chars). Consider using validate=False if intended."
+                        )
+                        raise MemoryWriteError(
+                            f"Rejected suspicious content for key '{key}': "
+                            f"appears to be hallucinated code ({len(value)} chars). "
+                            "If this is intentional, use validate=False."
+                        )
+
+            self._data[key] = value
+            self._key_writers[key] = branch_id
+            return True
+
+    def clear_parallel_tracking(self) -> None:
+        """Clear the key writers tracking. Call this after parallel execution completes."""
+        self._key_writers.clear()
 
     def _contains_code_indicators(self, value: str) -> bool:
         """

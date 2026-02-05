@@ -933,12 +933,18 @@ class GraphExecutor:
                         )
                         # Write cleaned output to memory
                         for key, value in cleaned_output.items():
-                            await memory.write_async(key, value)
+                            await memory.write_async_parallel(
+                                key, value, branch.branch_id,
+                                self._parallel_config.memory_conflict_strategy,
+                            )
 
                 # Map inputs via edge
                 mapped = branch.edge.map_inputs(source_result.output, memory.read_all())
                 for key, value in mapped.items():
-                    await memory.write_async(key, value)
+                    await memory.write_async_parallel(
+                        key, value, branch.branch_id,
+                        self._parallel_config.memory_conflict_strategy,
+                    )
 
                 # Execute with retries
                 last_result = None
@@ -958,7 +964,10 @@ class GraphExecutor:
                     if result.success:
                         # Write outputs to shared memory using async write
                         for key, value in result.output.items():
-                            await memory.write_async(key, value)
+                            await memory.write_async_parallel(
+                                key, value, branch.branch_id,
+                                self._parallel_config.memory_conflict_strategy,
+                            )
 
                         branch.result = result
                         branch.status = "completed"
@@ -1024,6 +1033,9 @@ class GraphExecutor:
         self.logger.info(
             f"   ⑃ Fan-out complete: {len(branch_results)}/{len(branches)} branches succeeded"
         )
+
+        # Clear parallel tracking after execution completes
+        memory.clear_parallel_tracking()
         return branch_results, total_tokens, total_latency
 
     def register_node(self, node_id: str, implementation: NodeProtocol) -> None:
